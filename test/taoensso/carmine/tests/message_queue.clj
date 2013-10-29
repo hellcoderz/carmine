@@ -93,3 +93,21 @@
         (wcar {} (mq/enqueue tq :msg1 :mid1))) ; Dupe
 (expect "mid1" (do (Thread/sleep 3000) ; Wait for backoff to expire
                    (wcar {} (mq/enqueue tq :msg1 :mid1))))
+
+;;;; Handling: dedupe-enqueue while locked
+(expect (constantly true) (mq/clear-queues {} tq))
+(expect "mid1" (wcar {} (mq/enqueue tq :msg1 :mid1)))
+(expect "eoq-backoff" (wcar {} (dequeue* tq)))
+(expect :locked (do (-> (mq/handle1 {} tq (fn [_] (Thread/sleep 2000) ; Hold lock
+                                                  {:status :success})
+                                    (wcar {} (dequeue* tq)))
+                        (future))
+                    (Thread/sleep 20)
+                    (wcar {} (mq/message-status tq :mid1))))
+(expect {:carmine.mq/error :locked} (wcar {} (mq/enqueue tq :msg1 :mid1)))
+(expect "mid1" (wcar {} (mq/enqueue tq :msg1 :mid1 :allow-locked-dupe?)))
+(expect :queued ; cmp :done-awaiting-gc
+        (do (Thread/sleep 3000) ; Wait for handler to complete
+            (wcar {} (mq/message-status tq :mid1))))
+(expect "eoq-backoff"    (wcar {} (dequeue* tq)))
+(expect ["mid1" :msg1 1] (wcar {} (dequeue* tq)))
