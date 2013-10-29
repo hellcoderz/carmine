@@ -1,4 +1,4 @@
-## v2.3.1 → v2.4.0-beta1 (major update)
+## v2.3.1 → v2.4.0-beta2 (major update!)
 
   * **IMPORTANT** Message queues: pre-2.4.0-beta1 queues *should* be compatible with 2.4.0-beta1+, but I would recommend **draining your old queues before upgrading** to 2.4.0-beta1+ to be on the safe side. That is: if you have any queued work outstanding - finish processing the work **before upgrading Carmine**.
   * **POTENTIALLY BREAKING** Parsers: `with-replies` now passes enclosing parser state to its body. This only affects you if you have used `with-replies` to write custom Redis commands that operate within an implicit context _and_ you interpret the `with-replies` result internally. The new docstring contains details.
@@ -17,6 +17,9 @@
   * Message queues: `message-status` now has more detailed return types (see docstring for details).
   * Message queues: multi-worker end-of-queue backoffs are now synchronized more efficiently.
   * Message queues: workers now accept an optional monitor fn for queue-status logging, etc. (see docstring for details). A default monitor is provided that will warn when queue size > 1000 items.
+  * Message queues: workers now accept an optional `nthreads` arg for spinning up synchronized multi-threaded workers.
+  * Message queues: handlers now receive message id along with other args.
+  * Message queues: `enqueue` now takes an optional flag to specify dedupe behaviour when message is locked.
 
 
 ## v2.2.3 → v2.3.1

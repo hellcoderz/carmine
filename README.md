@@ -2,7 +2,7 @@
 
 ```clojure
 [com.taoensso/carmine "2.3.1"] ; Stable; see CHANGELOG for changes since 1.x
-[com.taoensso/carmine "2.4.0-beta1"] ; Development; see CHANGELOG for details
+[com.taoensso/carmine "2.4.0-beta2"] ; Development; see CHANGELOG for details
 ```
 
 v2 adds API improvements, integration with [Nippy v2](https://github.com/ptaoussanis/nippy) for pluggable compression+crypto, improved performance, additional message queue features, and [Tundra](#tundra) - an API for archiving cold data to an additional datastore. (A [Faraday DynamoDB](https://github.com/ptaoussanis/faraday) implementation is included).
