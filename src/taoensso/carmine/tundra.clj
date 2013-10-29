@@ -1,16 +1,10 @@
 (ns taoensso.carmine.tundra
-  "Alpha - subject to change (hide the kittens!).
-  Semi-automatic datastore layer for Carmine. It's like the magix.
-
-  Redis (2.6+) keys:
-    * carmine:tundra:dirty    -> set, dirty Redis keys.
-    * carmine:tundra:cleaning -> set, Redis keys currently being frozen
-                                 to datastore. Used for crash protection.
-
+  "Semi-automatic datastore layer for Carmine. It's like the magix.
   Use multiple Redis instances (recommended) or Redis databases for local key
   namespacing."
   {:author "Peter Taoussanis"}
   (:require [taoensso.carmine       :as car :refer (wcar)]
+            [taoensso.carmine.message-queue :as mq]
             [taoensso.carmine.utils :as utils]
             [taoensso.nippy         :as nippy]
             [taoensso.nippy.tools   :as nippy-tools]
@@ -18,9 +12,61 @@
 
 ;; TODO Redis 2.8+ http://redis.io/topics/notifications
 
-;;;; Private Redis commands
+;;;; Public interfaces
 
-(def ^:private tkey (memoize (partial car/key :carmine :tundra)))
+(defprotocol IDataStore "Extension point for additional datastores."
+  (put-key   [dstore k v] "(put-key dstore \"key\" \"val\") => e/o #{true <ex>}")
+  (fetch-key [dstore k]   "(fetch-key dstore \"key\") => e/o #{<frozen-val> <ex>}\""))
+
+(defprotocol IFreezer "Extension point for compressors, encryptors, etc."
+  (freeze [freezer x] "Returns datastore-ready key val.")
+  (thaw   [freezer x] "Returns Redis-ready key val."))
+
+(defprotocol ITundraStore
+  (ensure-ks* [tstore ks])
+  (dirty*     [tstore ks])
+  (worker     [tstore conn wopts]
+    "Alpha - subject to change.
+    Returns a threaded [message queue] worker to routinely freeze Redis keys
+    marked as dirty to datastore and mark successfully frozen keys as clean.
+    Logs any errors. THESE ERRORS ARE **IMPORTANT**: an email or other
+    appropriate notification mechanism is HIGHLY RECOMMENDED. If a worker shuts
+    down and your keys are set to expire YOU WILL IRREVOCABLY **LOSE DATA**.
+
+    Options:
+      :nattempts        - Number of times worker will attempt to freeze a key to
+                          datastore before failing permanently. >=1.
+      :retry-backoff-ms - Amount of time (msecs) to backoff before retrying a
+                          failed key freeze. >=0. Can be a (fn [attempt]) -> ms.
+
+      :montior, :eoq-backoff-ms, :nthreads, :throttle-ms, :auto-start?
+      - Standard `taoensso.carmine.message-queue/worker` opts."))
+
+(defn ensure-ks
+  "BLOCKS to ensure given keys (previously created) are available in Redis,
+  fetching them from datastore as necessary. Throws an exception if any keys
+  couldn't be made available. Acts as a Redis command: call within a `wcar`
+  context."
+  [tstore & ks] (ensure-ks* tstore ks))
+
+(defn dirty
+  "Queues given keys for freezing to datastore. Throws an exception if any keys
+  don't exist. Acts as a Redis command: call within a `wcar` context.
+
+  If TundraStore has a :redis-ttl-ms option, **MARKS GIVEN KEYS FOR EXPIRY**!!
+  ** Worker MUST be running AND FUNCTIONING CORRECTLY or DATA WILL BE LOST! **"
+  [tstore & ks] (dirty* tstore ks))
+
+;;;; Default implementations
+
+(defrecord NippyFreezer [opts]
+  IFreezer
+  (freeze [_ x]  (nippy/freeze x  opts))
+  (thaw   [_ ba] (nippy/thaw   ba opts)))
+
+(def nippy-freezer "Default Nippy Freezer." (->NippyFreezer {}))
+
+;;;;
 
 (defn- extend-exists
   "Returns 0/1 for each key that doesn't/exist, extending any preexisting TTLs."
@@ -42,246 +88,130 @@
 
 (comment (wcar {} (car/ping) (extend-exists nil ["k1" "invalid" "k3"])))
 
-(defn- pexpire-dirty-exists
-  "Returns 0/1 for each key that doesn't/exist, setting (/extending) TTLs and
-  marking keys as dirty."
-  ;; Cluster: no between-key atomicity requirements, can pipeline per shard
-  [ttl-ms keys]
-  (car/lua
-    "local dirty_set = table.remove(KEYS) -- Last script key is set key
-     local ttl = tonumber(ARGV[1])
-     local result = {}
-     for i,k in pairs(KEYS) do
-       if ttl > 0 then
-         if redis.call('pexpire', k, ttl) > 0 then
-           redis.call('sadd', dirty_set, k)
-           result[i] = 1
-         else
-           result[i] = 0
-         end
-       elseif redis.call('exists', k) > 0 then
-         redis.call('sadd', dirty_set, k)
-         result[i] = 1
-       else
-         result[i] = 0
-       end
-     end
-     return result"
-    (conj (vec keys) (tkey :dirty))
-    [(or ttl-ms 0)]))
+(defn- extend-exists-missing-ks [ttl-ms ks]
+  (let [existance-replies (->> (extend-exists ttl-ms ks)
+                               (car/with-replies)
+                               (car/parse nil))
+        ks-missing        (->> (mapv #(when (zero? %2) %1) ks existance-replies)
+                               (filterv identity))]
+    ks-missing))
 
-(comment (wcar {} (pexpire-dirty-exists nil ["k1" "k2" "k3"])))
-
-;;;; Public interfaces
-
-(defprotocol IDataStore ; Main extension point
-  (put-keys   [store keyed-data] "{<k> <frozen-data> ...} -> {<k> <success?> ...}.")
-  (fetch-keys [store ks] "[<k> ...] -> {<k> <frozen-data>}."))
-
-(defprotocol IFreezer
-  (freeze [freezer x] "Returns datastore-ready key data.")
-  (thaw   [freezer x] "Returns Redis-ready key data."))
-
-(defprotocol IWorker
-  (start [this] "Returns true iff worker successfully started.")
-  (stop  [this] "Returns true iff worker successfully stopped."))
-
-(defprotocol ITundraStore
-  (ensure-ks* [store ks])
-  (dirty*     [store ks])
-  (worker     [store conn opts]
-    "Alpha - subject to change.
-    Returns a threaded worker to routinely freeze Redis keys marked as dirty
-    to datastore and mark successfully frozen keys as clean. Logs any errors.
-    THESE ERRORS ARE IMPORTANT: an email or other appropriate notification
-    mechanism is HIGHLY RECOMMENDED.
-
-    Options: :frequency-ms - Interval between each freezing."))
-
-(defn ensure-ks
-  "Alpha - subject to change.
-  BLOCKS to ensure given keys (previously created) are available in Redis,
-  fetching them from datastore as necessary. Throws an exception if any keys
-  couldn't be made available. Acts as a Redis command: call within a `wcar`
-  context."
-  [store & ks] (ensure-ks* store ks))
-
-(defn dirty
-  "Alpha - subject to change.
-  **MARKS GIVEN KEYS FOR EXPIRY** and adds them to dirty set for freezing to
-  datastore on worker's next scheduled freeze. Throws an exception if any keys
-  don't exist. Acts as a Redis command: call within a `wcar` context.
-
-  ****************************************************************************
-  ** Worker MUST be running AND FUNCTIONING CORRECTLY or DATA WILL BE LOST! **
-  ****************************************************************************"
-  [store & ks] (dirty* store ks))
-
-;;;; Default implementations
-
-(defrecord NippyFreezer [opts]
-  IFreezer
-  (freeze [_ x]  (nippy/freeze x  opts))
-  (thaw   [_ ba] (nippy/thaw   ba opts)))
-
-(def nippy-freezer "Default Nippy Freezer." (->NippyFreezer {}))
-
-(defrecord DiskDataStore [path]
-  IDataStore
-  (put-keys   [store keyed-data])
-  (fetch-keys [store ks]))
-
-(defrecord Worker [conn work-fn running? opts]
-  IWorker
-  (stop  [_] (let [stopped? @running?] (reset! running? false) stopped?))
-  (start [_]
-    (when-not @running?
-      (reset! running? true)
-      (future
-        (let [{:keys [frequency-ms]} opts]
-          (while @running?
-            (try (work-fn)
-              (catch Throwable t
-                (timbre/fatal t
-                 "CRITICAL worker error, shutting down! DATA AT RISK!!")
-                (throw t)))
-            (when frequency-ms (Thread/sleep frequency-ms)))))
-      true)))
-
-(defn- prep-ks [ks] (assert (utils/coll?* ks)) (vec (distinct (map name ks))))
+(defn- prep-ks [ks] (assert (utils/coll?* ks)) (vec (distinct (mapv name ks))))
 (comment (prep-ks [nil]) ; ex
          (prep-ks [:a "a" :b :foo.bar/baz]))
 
+(defmacro ^:private catcht [& body] `(try (do ~@body) (catch Throwable t# t#)))
+(def ^:private tqname "carmine.tundra")
+
 (defrecord TundraStore [datastore freezer opts]
   ITundraStore
-  (ensure-ks* [store ks]
-    (let [ks (prep-ks ks)
-          {:keys [redis-ttl-ms]} opts
-          existance-replies (->> (extend-exists redis-ttl-ms ks)
-                                 (car/with-replies)
-                                 (car/parse nil) ; Nb
-                                 ) ; Throws on errors
-          missing-ks        (->> (mapv #(when (zero? %2) %1) ks existance-replies)
-                                 (filterv identity))]
+  (ensure-ks* [tstore ks]
+    (let [{:keys [redis-ttl-ms]} opts
+          ks         (prep-ks ks)
+          ks-missing (extend-exists-missing-ks redis-ttl-ms ks)]
 
-      (when-not (empty? missing-ks)
-        (timbre/trace "Fetching missing keys:" missing-ks)
-        (let [keyed-data ; {<redis-key> <thawed-data> ...}
-              (let [frozen-data (fetch-keys datastore missing-ks)]
-                (if-not freezer frozen-data
-                        (utils/map-kvs nil (partial thaw freezer) frozen-data)))
+      (when-not (empty? ks-missing)
+        (timbre/tracef "Fetching missing keys: %s" ks-missing)
 
-              ;; Restore what we can even if some fetches failed
-              restore-replies ; {<redis-key> <restore-reply> ...}
-              (->> (doseq [[k data] keyed-data]
-                     (if-not (utils/bytes? data)
-                       (car/return (Exception. "Malformed fetch data"))
-                       (car/restore k (or redis-ttl-ms 0) (car/raw data))))
-                   (car/with-replies :as-pipeline) ; ["OK" "OK" ...]
-                   (car/parse nil) ; Nb
-                   (zipmap (keys keyed-data)))
+        (let [;;; [] e/o #{<dumpval> <throwable>}:
+              throwable?    #(instance? Throwable %)
+              dvals-missing (->> ks-missing (mapv #(catcht (fetch-key datastore %))))
+              dvals-missing (if (nil? freezer) dvals-missing
+                                (->> dvals-missing
+                                     (mapv #(if (throwable? %) %
+                                                (catcht (thaw freezer %))))))
+              restore-replies ; [] e/o #{"OK" <throwable>}
+              (->> dvals-missing
+                   (mapv (fn [k dv]
+                           (if (throwable? dv) (car/return dv)
+                               (if-not (utils/bytes? dv)
+                                 (car/return (Exception. "Malformed fetch data"))
+                                 (car/restore k (or redis-ttl-ms 0) (car/raw dv)))))
+                         ks-missing)
+                   (car/with-replies :as-pipeline)
+                   (car/parse nil))
 
-              errors ; {<redis-key> <error> ...}
-              (reduce
-               (fn [m k]
-                 (if-not (contains? keyed-data k)
-                   (assoc m k "Fetch failed")
-                   (let [^Exception rr (restore-replies k)]
-                     (if (or (not (instance? Exception rr))
-                             ;; Already restored:
-                             (= (.getMessage rr) "ERR Target key name is busy."))
-                       m (assoc m k (.getMessage rr))))))
-               (sorted-map) missing-ks)]
-
+              errors ; {<k> <throwable>}
+              (->> (zipmap ks-missing restore-replies)
+                   (reduce (fn [m [k v]]
+                             (if-not (throwable? v) m
+                               (if (and (instance? Exception v)
+                                        (= (.getMessage ^Exception v)
+                                           "ERR Target key name is busy."))
+                                 m ; Already restored
+                                 (assoc m k v))))
+                           {}))]
           (when-not (empty? errors)
             (let [ex (ex-info "Failed to ensure some key(s)" errors)]
               (timbre/error ex) (throw ex)))
           nil))))
 
-  (dirty* [store ks]
-    (let [ks (prep-ks ks)
-          {:keys [redis-ttl-ms]} opts
-          existance-replies (->> (pexpire-dirty-exists redis-ttl-ms ks)
-                                 (car/with-replies)
-                                 (car/parse nil) ; Nb
-                                 ) ; Throws on errors
-          missing-ks        (->> (mapv #(when (zero? %2) %1) ks existance-replies)
-                                 (filterv identity))]
-      (when-not (empty? missing-ks)
-        (let [ex (ex-info "Some key(s) were missing" {:missing-ks missing-ks})]
+  (dirty* [tstore ks]
+    (let [{:keys [redis-ttl-ms]} opts
+          ks             (prep-ks ks)
+          ks-missing     (extend-exists-missing-ks redis-ttl-ms ks)
+          ks-not-missing (->> ks (filterv (complement (set ks-missing))))]
+
+      (doseq [k ks-not-missing]
+        (mq/enqueue tqname k k :allow-locked-dupe)) ; key as msg & mid (deduped)
+
+      (when-not (empty? ks-missing)
+        (let [ex (ex-info "Some dirty key(s) were missing" {:ks ks-missing})]
           (timbre/error ex) (throw ex)))
       nil))
 
-  (worker [store conn wopts]
-    (let [{:keys [frequency-ms auto-start?]
-           :or   {frequency-ms (* 1000 60 60) ; Once/hr
-                  auto-start?  true}} wopts
+  (worker [tstore conn wopts]
+    (let [{:keys [nattempts retry-backoff-ms]
+           :or   {nattempts 3
+                  retry-backoff-ms mq/exp-backoff}} wopts]
+      (mq/worker conn tqname
+        (assoc wopts :handler
+          (fn [{:keys [mid message attempt]}]
+            (let [k message
+                  put-reply ; #{true nil <throwable>}
+                  (catcht (->> (wcar conn (car/parse-raw (car/dump k)))
+                               (#(if (or (nil? %) ; Key doesn't exist
+                                         (nil? freezer)) %
+                                         (freeze freezer %)))
+                               (#(if (nil? %) nil
+                                     (put-key datastore k %)))))]
 
-          work-fn
-          (fn []
-            (timbre/trace "Worker job running:" wopts)
-            (let [kdset (tkey :dirty)
-                  kcset (tkey :cleaning)
-                  [ks-dirty ks-cleaning] (wcar conn (car/smembers kdset)
-                                                    (car/smembers kcset))
+              (if (= put-reply true)
+                {:status :success}
+                (if (<= attempt nattempts)
+                  {:status :retry
+                   :backoff-ms
+                   (cond (nil?     retry-backoff-ms) nil
+                         (fn?      retry-backoff-ms) (retry-backoff-ms attempt)
+                         (integer? retry-backoff-ms) retry-backoff-ms)}
 
-                  ;; Grab ks from both dirty AND cleaning sets (the
-                  ;; latter will be empty unless prev work-fn failed):
-                  ks-to-freeze (vec (into (set ks-dirty) ks-cleaning))]
+                  {:status :error
+                   :throwable
+                   (cond
+                    (nil? put-reply) (ex-info "Key doesn't exist" {:k k})
+                    :else (ex-info "Bad put-reply" {:k k :put-reply put-reply}))})))))))))
 
-              (when-not (empty? ks-to-freeze)
-                (timbre/trace "Freezing keys:" ks-to-freeze)
-                (wcar conn (mapv (partial car/smove kdset kcset) ks-to-freeze))
-                (let [dumps ; [<raw-data-or-nil> ...]
-                      (wcar conn (car/parse-raw (mapv car/dump ks-to-freeze)))
-
-                      keyed-data ; {<existing-redis-key> <frozen-data> ...}
-                      (let [thawed-data
-                            (->> (mapv vector ks-to-freeze dumps)
-                                 (reduce (fn [m [k dump]]
-                                           (if-not dump m (assoc m k dump))) {}))
-                            thawed-data
-                            (if-not freezer thawed-data
-                                    (utils/map-kvs nil (partial freeze freezer)
-                                                   thawed-data))]
-                        thawed-data)]
-
-                  (when-not (empty? keyed-data)
-                    (let [put-replies ; {<redis-key> <success?> ...}
-                          (try (put-keys datastore keyed-data)
-                               (catch Exception _ nil))
-
-                          ks-succeeded (->> (keys put-replies)
-                                            (filterv put-replies))
-                          ks-failed    (vec (reduce disj (set ks-to-freeze)
-                                                    ks-succeeded))]
-
-                      (wcar conn (mapv (partial car/srem kcset) ks-succeeded))
-                      (when-not (empty? ks-failed) ; Don't rethrow!
-                        (let [ex (ex-info "Failed to freeze some key(s)"
-                                          {:failed-ks ks-failed})]
-                          (timbre/error ex)))))))))
-
-          w (->Worker conn work-fn (atom false) {:frequency-ms frequency-ms})]
-      (when auto-start? (start w)) w)))
+;;;;
 
 (defn tundra-store
   "Alpha - subject to change.
   Returns a TundraStore with options:
-    datastore     - Storage for frozen key data.
-                    See `taoensso.carmine.tundra.faraday/faraday-datastore` for
-                    Faraday (DynamoDB) datastore.
-    :redis-ttl-ms - Optional. Time after which frozen, inactive keys will be
-                    EVICTED FROM REDIS. Defaults to ~31 days, minimum 10 hours.
+    datastore     - Storage for frozen key data. Default datastores:
+                    `taoensso.carmine.tundra.faraday/faraday-datastore`
+                    `taoensso.carmine.tundra.s3/s3-datastore`.
     :freezer      - Optional. Preps key data to/from datastore. May provide
                     services like compression and encryption, etc. Defaults to
                     Nippy with default options (Snappy compression and no
                     encryption).
+    :redis-ttl-ms - Optional! Time after which frozen, inactive keys will be
+                    EVICTED FROM REDIS (**DELETED!**). Minimum 10 hours. ONLY
+                    use this if you have CONFIRMED that your worker is
+                    successfully freezing the necessary keys to your datastore.
+                    Otherwise YOU WILL IRREVOCABLY **LOSE DATA**.
 
   See `ensure-ks`, `dirty`, `worker` for TundraStore API."
-  [datastore & [{:keys [redis-ttl-ms freezer]
-                 :or   {redis-ttl-ms (* 1000 60 60 24 31) ; Expire ~once/month
-                        freezer nippy-freezer}}]]
+  [datastore & [{:keys [freezer redis-ttl-ms ]
+                 :or   {freezer nippy-freezer}}]]
 
   (assert (or (nil? freezer) (satisfies? IFreezer freezer)))
   (assert (satisfies? IDataStore datastore))
